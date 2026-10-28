@@ -10,7 +10,9 @@ mod tray;
 
 use chrono::Local;
 use client::ApiClient;
-use clipboard::{ClipboardContent, ClipboardManager, IS_WRITING_CLIPBOARD, LAST_PROCESSED_HASH};
+use clipboard::{
+    is_hash_processed, mark_hash_processed, ClipboardContent, ClipboardManager, IS_WRITING_CLIPBOARD,
+};
 use config::AppConfig;
 use models::{ProfileDto, ProfileType};
 use std::sync::atomic::Ordering;
@@ -22,7 +24,10 @@ const MAX_LOG_SIZE: u64 = 1024 * 1024; // 1 MB 上限
 
 pub fn log_info(msg: impl AsRef<str>) {
     let text = msg.as_ref();
-    let _ = eprintln!("{}", text);
+    #[cfg(debug_assertions)]
+    {
+        let _ = eprintln!("{}", text);
+    }
     use std::io::Write;
     let log_path = "syncclipboard.log";
 
@@ -130,14 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Some(content) = ClipboardManager::read_clipboard() {
                     let hash = content.compute_hash();
                     log_info(format!("[Select] 本地剪贴板读到内容, hash = {}", hash));
-                    {
-                        let mut last = LAST_PROCESSED_HASH.lock().unwrap();
-                        if last.eq_ignore_ascii_case(&hash) {
-                            log_info("[Select] 本地内容与上一次相同，跳过");
-                            continue;
-                        }
-                        *last = hash.to_uppercase();
+                    if is_hash_processed(&hash) {
+                        log_info("[Select] 本地内容为近期已处理内容，跳过");
+                        continue;
                     }
+                    mark_hash_processed(&hash);
 
                     log_info("[Select] 准备更新托盘状态为 正在上传");
                     tray_ctrl.update_status("正在上传");
@@ -208,6 +210,7 @@ async fn handle_local_upload(
         ClipboardContent::Text(text) => {
             log_info(format!("[handle_local_upload] 处理文本内容, 长度: {}", text.len()));
             let text_hash = ClipboardContent::compute_sha256(text.as_bytes());
+            mark_hash_processed(&text_hash);
             let dto = ProfileDto {
                 r#type: ProfileType::Text,
                 hash: text_hash,
@@ -228,6 +231,8 @@ async fn handle_local_upload(
             let transfer_data_hash = ClipboardContent::compute_sha256(&png_bytes);
             let combined = format!("{}|{}", file_name, transfer_data_hash.to_uppercase());
             let profile_hash = ClipboardContent::compute_sha256(combined.as_bytes());
+            mark_hash_processed(&profile_hash);
+            mark_hash_processed(&transfer_data_hash);
             let size = png_bytes.len() as i64;
 
             // 1. 上传图片文件
@@ -262,9 +267,11 @@ async fn handle_remote_profile(
         return;
     }
 
-    {
-        let last = LAST_PROCESSED_HASH.lock().unwrap();
-        if last.eq_ignore_ascii_case(&dto.hash) {
+    if is_hash_processed(&dto.hash) {
+        return;
+    }
+    if let Some(ref th) = dto.transfer_data_hash {
+        if is_hash_processed(th) {
             return;
         }
     }
@@ -290,10 +297,12 @@ async fn handle_remote_profile(
                 dto.text.clone()
             };
 
+            let text_sha256 = ClipboardContent::compute_sha256(full_text.as_bytes());
+            mark_hash_processed(&dto.hash);
+            mark_hash_processed(&text_sha256);
+
             let write_res = ClipboardManager::write_text(&full_text);
             if write_res.is_ok() {
-                let mut last = LAST_PROCESSED_HASH.lock().unwrap();
-                *last = dto.hash.to_uppercase();
                 log_info("[Download] 远程文本已成功写入本地剪贴板！");
             }
             write_res
@@ -302,10 +311,15 @@ async fn handle_remote_profile(
             if let Some(ref data_name) = dto.data_name {
                 match client.get_file(data_name).await {
                     Ok(png_bytes) => {
+                        let content_hash = ClipboardContent::compute_sha256(&png_bytes);
+                        mark_hash_processed(&dto.hash);
+                        if let Some(ref th) = dto.transfer_data_hash {
+                            mark_hash_processed(th);
+                        }
+                        mark_hash_processed(&content_hash);
+
                         let write_res = ClipboardManager::write_image(&png_bytes);
                         if write_res.is_ok() {
-                            let mut last = LAST_PROCESSED_HASH.lock().unwrap();
-                            *last = dto.hash.to_uppercase();
                             log_info("[Download] 远程图片已成功写入本地剪贴板！");
                         }
                         write_res

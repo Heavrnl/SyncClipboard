@@ -6,15 +6,39 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
 
 const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15; // 文件/文件夹拖拽格式
 
 pub static IS_WRITING_CLIPBOARD: AtomicBool = AtomicBool::new(false);
-pub static LAST_PROCESSED_HASH: Mutex<String> = Mutex::new(String::new());
+static RECENT_HASHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub fn mark_hash_processed(hash: &str) {
+    if hash.is_empty() {
+        return;
+    }
+    let mut list = RECENT_HASHES.lock().unwrap();
+    let upper = hash.to_uppercase();
+    if !list.contains(&upper) {
+        if list.len() >= 32 {
+            list.remove(0);
+        }
+        list.push(upper);
+    }
+}
+
+pub fn is_hash_processed(hash: &str) -> bool {
+    if hash.is_empty() {
+        return false;
+    }
+    let list = RECENT_HASHES.lock().unwrap();
+    list.iter().any(|h| h.eq_ignore_ascii_case(hash))
+}
 
 #[derive(Debug, Clone)]
 pub enum ClipboardContent {
@@ -63,6 +87,11 @@ impl ClipboardManager {
     }
 
     unsafe fn read_clipboard_inner() -> Option<ClipboardContent> {
+        // 0. 优先检测是否为文件/文件夹复制 (CF_HDROP)，若是则直接忽略，绝不上传
+        if IsClipboardFormatAvailable(CF_HDROP).is_ok() {
+            return None;
+        }
+
         // 1. 优先尝试读取图片 (CF_DIB)
         let dib_handle = GetClipboardData(CF_DIB);
         if let Ok(handle) = dib_handle {
