@@ -467,3 +467,6 @@ build/linux/pupnet/build_bin/
 TODO.md
 docs/image/todo/FluentAvaloniaContentDialog.png
 build/temp/
+target/
+src/**/target/
+syncclipboard.log*

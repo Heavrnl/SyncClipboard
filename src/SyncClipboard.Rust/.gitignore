@@ -1,0 +1,5 @@
+/target
+*.log
+*.log.*
+syncclipboard.log
+syncclipboard.log.bak
