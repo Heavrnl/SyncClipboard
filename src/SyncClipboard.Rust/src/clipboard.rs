@@ -16,28 +16,70 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15; // 文件/文件夹拖拽格式
 
 pub static IS_WRITING_CLIPBOARD: AtomicBool = AtomicBool::new(false);
-static RECENT_HASHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-pub fn mark_hash_processed(hash: &str) {
-    if hash.is_empty() {
-        return;
-    }
-    let mut list = RECENT_HASHES.lock().unwrap();
-    let upper = hash.to_uppercase();
-    if !list.contains(&upper) {
-        if list.len() >= 32 {
-            list.remove(0);
-        }
-        list.push(upper);
-    }
+// 最近一次从远端下载并写入剪贴板的内容哈希（用于单次消费防回环）
+static JUST_DOWNLOADED_HASH: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_just_downloaded_hash(hash: String) {
+    let mut lock = JUST_DOWNLOADED_HASH.lock().unwrap();
+    *lock = Some(hash.to_uppercase());
 }
 
-pub fn is_hash_processed(hash: &str) -> bool {
-    if hash.is_empty() {
-        return false;
+pub fn consume_if_just_downloaded(hash: &str) -> bool {
+    let mut lock = JUST_DOWNLOADED_HASH.lock().unwrap();
+    if let Some(ref down_hash) = *lock {
+        if down_hash.eq_ignore_ascii_case(hash) {
+            *lock = None;
+            return true;
+        }
     }
-    let list = RECENT_HASHES.lock().unwrap();
-    list.iter().any(|h| h.eq_ignore_ascii_case(hash))
+    false
+}
+
+// 本地剪贴板检测防抖（500ms 内相同内容认为是同一次复制或多系统事件抖动）
+static LAST_LOCAL_DETECTION: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+
+pub fn is_local_debounce(hash: &str) -> bool {
+    let mut lock = LAST_LOCAL_DETECTION.lock().unwrap();
+    let now = std::time::Instant::now();
+    if let Some((ref last_hash, ref last_time)) = *lock {
+        if last_hash.eq_ignore_ascii_case(hash)
+            && now.duration_since(*last_time) < std::time::Duration::from_millis(500)
+        {
+            return true;
+        }
+    }
+    *lock = Some((hash.to_uppercase(), now));
+    false
+}
+
+// 当前远端已知最新的哈希（防止重复下载自己刚上传的内容）
+static LAST_REMOTE_HASH: Mutex<Option<String>> = Mutex::new(None);
+static LAST_REMOTE_TRANSFER_HASH: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_last_remote_hash(hash: &str, transfer_data_hash: Option<&str>) {
+    let mut lock = LAST_REMOTE_HASH.lock().unwrap();
+    *lock = Some(hash.to_uppercase());
+    let mut trans_lock = LAST_REMOTE_TRANSFER_HASH.lock().unwrap();
+    *trans_lock = transfer_data_hash.map(|s| s.to_uppercase());
+}
+
+pub fn is_same_as_last_remote(hash: &str, transfer_data_hash: Option<&str>) -> bool {
+    let lock = LAST_REMOTE_HASH.lock().unwrap();
+    if let Some(ref h) = *lock {
+        if h.eq_ignore_ascii_case(hash) {
+            return true;
+        }
+    }
+    if let Some(th) = transfer_data_hash {
+        let trans_lock = LAST_REMOTE_TRANSFER_HASH.lock().unwrap();
+        if let Some(ref rh) = *trans_lock {
+            if rh.eq_ignore_ascii_case(th) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +175,8 @@ impl ClipboardManager {
     }
 
     pub fn write_text(text: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let text_hash = ClipboardContent::compute_sha256(text.as_bytes());
+        set_just_downloaded_hash(text_hash);
         IS_WRITING_CLIPBOARD.store(true, Ordering::SeqCst);
         let res = unsafe {
             if !Self::open_clipboard_with_retry() {
@@ -163,11 +207,14 @@ impl ClipboardManager {
             }
             Ok(())
         };
+        std::thread::sleep(std::time::Duration::from_millis(30));
         IS_WRITING_CLIPBOARD.store(false, Ordering::SeqCst);
         res
     }
 
     pub fn write_image(png_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let image_hash = ClipboardContent::compute_sha256(png_bytes);
+        set_just_downloaded_hash(image_hash);
         IS_WRITING_CLIPBOARD.store(true, Ordering::SeqCst);
         let res = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let dib_bytes = png_to_dib(png_bytes)?;
@@ -197,6 +244,7 @@ impl ClipboardManager {
                 Ok(())
             }
         })();
+        std::thread::sleep(std::time::Duration::from_millis(30));
         IS_WRITING_CLIPBOARD.store(false, Ordering::SeqCst);
         res
     }

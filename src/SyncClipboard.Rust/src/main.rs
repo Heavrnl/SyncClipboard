@@ -11,7 +11,8 @@ mod tray;
 use chrono::Local;
 use client::ApiClient;
 use clipboard::{
-    is_hash_processed, mark_hash_processed, ClipboardContent, ClipboardManager, IS_WRITING_CLIPBOARD,
+    consume_if_just_downloaded, is_local_debounce, is_same_as_last_remote, set_last_remote_hash,
+    ClipboardContent, ClipboardManager, IS_WRITING_CLIPBOARD,
 };
 use config::AppConfig;
 use models::{ProfileDto, ProfileType};
@@ -135,11 +136,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Some(content) = ClipboardManager::read_clipboard() {
                     let hash = content.compute_hash();
                     log_info(format!("[Select] 本地剪贴板读到内容, hash = {}", hash));
-                    if is_hash_processed(&hash) {
-                        log_info("[Select] 本地内容为近期已处理内容，跳过");
+
+                    // 1. 检查是否为刚下载写入本地剪贴板触发的系统事件（单次消费拦截，彻底杜绝回环死循环）
+                    if consume_if_just_downloaded(&hash) {
+                        log_info("[Select] 检测到为刚下载写入本地剪贴板触发的系统事件，已自动消费并跳过，防止回环");
                         continue;
                     }
-                    mark_hash_processed(&hash);
+
+                    // 2. 本地事件 500ms 毫秒级防抖（避免单次复制产生的双系统事件或狂按快捷键抖动）
+                    if is_local_debounce(&hash) {
+                        log_info("[Select] 500ms 内重复事件，已防抖跳过");
+                        continue;
+                    }
 
                     log_info("[Select] 准备更新托盘状态为 正在上传");
                     tray_ctrl.update_status("正在上传");
@@ -195,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     #[allow(unreachable_code)]
     {
-        log_info("[Main] 主循环已退出");
+        log_info("[Main] 主循环已退出！");
         Ok(())
     }
 }
@@ -210,10 +218,9 @@ async fn handle_local_upload(
         ClipboardContent::Text(text) => {
             log_info(format!("[handle_local_upload] 处理文本内容, 长度: {}", text.len()));
             let text_hash = ClipboardContent::compute_sha256(text.as_bytes());
-            mark_hash_processed(&text_hash);
             let dto = ProfileDto {
                 r#type: ProfileType::Text,
-                hash: text_hash,
+                hash: text_hash.clone(),
                 text,
                 has_data: false,
                 data_name: None,
@@ -223,6 +230,7 @@ async fn handle_local_upload(
             };
             log_info("[handle_local_upload] 正在发起 put_sync_profile HTTP 请求...");
             client.put_sync_profile(&dto).await?;
+            set_last_remote_hash(&text_hash, None);
             log_info("[Upload] 本地文本已成功同步");
         }
         ClipboardContent::Image(png_bytes) => {
@@ -231,8 +239,6 @@ async fn handle_local_upload(
             let transfer_data_hash = ClipboardContent::compute_sha256(&png_bytes);
             let combined = format!("{}|{}", file_name, transfer_data_hash.to_uppercase());
             let profile_hash = ClipboardContent::compute_sha256(combined.as_bytes());
-            mark_hash_processed(&profile_hash);
-            mark_hash_processed(&transfer_data_hash);
             let size = png_bytes.len() as i64;
 
             // 1. 上传图片文件
@@ -242,16 +248,17 @@ async fn handle_local_upload(
             // 2. 上传元数据 ProfileDto
             let dto = ProfileDto {
                 r#type: ProfileType::Image,
-                hash: profile_hash,
+                hash: profile_hash.clone(),
                 text: file_name.clone(),
                 has_data: true,
                 data_name: Some(file_name),
-                transfer_data_hash: Some(transfer_data_hash),
+                transfer_data_hash: Some(transfer_data_hash.clone()),
                 size: Some(size),
                 synced_at: Some(chrono::Utc::now()),
             };
             log_info("[handle_local_upload] 正在上传图片 ProfileDto...");
             client.put_sync_profile(&dto).await?;
+            set_last_remote_hash(&profile_hash, Some(&transfer_data_hash));
             log_info("[Upload] 本地图片已成功同步");
         }
     }
@@ -267,13 +274,9 @@ async fn handle_remote_profile(
         return;
     }
 
-    if is_hash_processed(&dto.hash) {
+    if is_same_as_last_remote(&dto.hash, dto.transfer_data_hash.as_deref()) {
+        log_info("[Download] 远端 Profile 与已知最新远端内容相同，无需重复下载");
         return;
-    }
-    if let Some(ref th) = dto.transfer_data_hash {
-        if is_hash_processed(th) {
-            return;
-        }
     }
 
     log_info(format!("[Download] 检测到远端新剪贴板 (类型: {:?}, Hash: {})", dto.r#type, dto.hash));
@@ -297,12 +300,9 @@ async fn handle_remote_profile(
                 dto.text.clone()
             };
 
-            let text_sha256 = ClipboardContent::compute_sha256(full_text.as_bytes());
-            mark_hash_processed(&dto.hash);
-            mark_hash_processed(&text_sha256);
-
             let write_res = ClipboardManager::write_text(&full_text);
             if write_res.is_ok() {
+                set_last_remote_hash(&dto.hash, None);
                 log_info("[Download] 远程文本已成功写入本地剪贴板！");
             }
             write_res
@@ -311,15 +311,9 @@ async fn handle_remote_profile(
             if let Some(ref data_name) = dto.data_name {
                 match client.get_file(data_name).await {
                     Ok(png_bytes) => {
-                        let content_hash = ClipboardContent::compute_sha256(&png_bytes);
-                        mark_hash_processed(&dto.hash);
-                        if let Some(ref th) = dto.transfer_data_hash {
-                            mark_hash_processed(th);
-                        }
-                        mark_hash_processed(&content_hash);
-
                         let write_res = ClipboardManager::write_image(&png_bytes);
                         if write_res.is_ok() {
+                            set_last_remote_hash(&dto.hash, dto.transfer_data_hash.as_deref());
                             log_info("[Download] 远程图片已成功写入本地剪贴板！");
                         }
                         write_res
