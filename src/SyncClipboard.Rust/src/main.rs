@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::panic::set_hook(Box::new(|info| {
         log_info(format!("[PANIC] {:?}", info));
     }));
-    log_info("[SyncClipboard Lite] 正在启动...");
+    log_info(format!("[SyncClipboard Lite] 正在启动... PID = {}", std::process::id()));
 
     // 1. 读取配置文件
     let config = match AppConfig::load() {
@@ -126,8 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         tokio::select! {
             // A. 本地剪贴板发生变化 -> 上传
-            Some(_) = clip_event_rx.recv() => {
-                if IS_PAUSED.load(Ordering::SeqCst) {
+            msg = clip_event_rx.recv() => {
+                if msg.is_none() || IS_PAUSED.load(Ordering::SeqCst) {
                     continue;
                 }
                 // 短暂延时等待剪贴板写入完成释放
@@ -165,16 +165,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             // B. 远端 SignalR 实时推送 -> 下载
-            Some(remote_dto) = remote_push_rx.recv() => {
-                log_info(format!("[Select] 远端推送唤醒: {:?}", remote_dto.r#type));
-                if !IS_PAUSED.load(Ordering::SeqCst) {
-                    handle_remote_profile(&api_client, remote_dto, &tray_ctrl).await;
+            msg = remote_push_rx.recv() => {
+                if let Some(remote_dto) = msg {
+                    log_info(format!("[Select] 远端推送唤醒: {:?}", remote_dto.r#type));
+                    if !IS_PAUSED.load(Ordering::SeqCst) {
+                        handle_remote_profile(&api_client, remote_dto, &tray_ctrl).await;
+                    }
                 }
             }
 
             // C. 定时轮询或托盘手动同步 -> 拉取检查
-            Some(_) = manual_sync_rx.recv() => {
-                if !IS_PAUSED.load(Ordering::SeqCst) {
+            msg = manual_sync_rx.recv() => {
+                if msg.is_some() && !IS_PAUSED.load(Ordering::SeqCst) {
                     match api_client.get_sync_profile().await {
                         Ok(dto) => {
                             handle_remote_profile(&api_client, dto, &tray_ctrl).await;
@@ -185,19 +187,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             // D. 弹出配置设置对话框
-            Some(_) = settings_rx.recv() => {
-                log_info("[Tray] 用户打开了配置设置对话框");
-                settings_dialog::show_settings_dialog(current_config.clone(), config_update_tx.clone());
+            msg = settings_rx.recv() => {
+                if msg.is_some() {
+                    log_info("[Tray] 用户打开了配置设置对话框");
+                    settings_dialog::show_settings_dialog(current_config.clone(), config_update_tx.clone());
+                }
             }
 
             // E. 配置已在界面中更新并保存
-            Some(new_cfg) = config_update_rx.recv() => {
-                log_info(format!("[Config] 收到新配置应用请求: URL = {}", new_cfg.server_url));
-                current_config = new_cfg;
-                api_client = ApiClient::new(&current_config);
-                tray_ctrl.update_status("配置已更新");
-                // 立即触发一次拉取
-                let _ = manual_sync_tx.send(());
+            msg = config_update_rx.recv() => {
+                if let Some(new_cfg) = msg {
+                    log_info(format!("[Config] 收到新配置应用请求: URL = {}", new_cfg.server_url));
+                    current_config = new_cfg;
+                    api_client = ApiClient::new(&current_config);
+                    tray_ctrl.update_status("配置已更新");
+                    // 立即触发一次拉取
+                    let _ = manual_sync_tx.send(());
+                }
             }
         }
     }
